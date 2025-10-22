@@ -1,4 +1,3 @@
-import io
 import re
 import cv2
 import json
@@ -15,7 +14,7 @@ from paddleocr import PaddleOCR  # działa na Python 3.10 (runtime.txt)
 # =========================
 st.set_page_config(page_title="FMCG Shelf MVP", layout="wide")
 
-# UWAGA: PaddleOCR nie ma "pol" – użyj "latin" (alfabet łaciński)
+# PaddleOCR nie ma "pol" – użyj "latin" (alfabet łaciński)
 OCR_LANG = "latin"
 ocr = PaddleOCR(lang=OCR_LANG, use_angle_cls=True, show_log=False)
 
@@ -24,7 +23,7 @@ PERCENT_RE = re.compile(r'(\d{1,3})\s*%')
 EAN_RE     = re.compile(r'(?<!\d)(\d{13})(?!\d)')  # 13 cyfr (EAN-13)
 
 # =========================
-# FUNKCJE POMOCNICZE
+# FUNKCJE
 # =========================
 def load_image(file) -> np.ndarray:
     img = Image.open(file).convert("RGB")
@@ -82,7 +81,7 @@ def find_price_tag_candidates(gray: np.ndarray):
 
 def safe_paddle_ocr(img_rgb):
     """
-    Bezpieczny wrapper na PaddleOCR: zawsze zwraca listę [(text, conf), ...]
+    Bezpieczny wrapper na PaddleOCR: zwraca listę [(text, conf), ...]
     niezależnie od struktury/wyjątków w zwrotce.
     """
     try:
@@ -94,12 +93,10 @@ def safe_paddle_ocr(img_rgb):
     if not res:
         return lines
 
-    # res to lista "stron"; dla 1 obrazu zwykle 1 strona
     for page in res:
         if not page:
             continue
         for det in page:
-            # spodziewane: [box_coords, (text, score)]
             if not isinstance(det, (list, tuple)) or len(det) < 2:
                 continue
             txt_pack = det[1]
@@ -125,9 +122,9 @@ def full_image_ocr(img: np.ndarray):
     lines = safe_paddle_ocr(rgb)
     return "\n".join([t for t, _ in lines])
 
-def expand_box_up(box, img_shape, up_factor=1.4, side_factor=0.3):
+def expand_box_up(box, img_shape, up_factor=2.2, side_factor=0.5):
     """
-    Powiększ wycinek do góry (łapiemy część opakowania nad etykietą).
+    Powiększ wycinek do góry (łapiemy front opakowania).
     """
     x, y, w, h = box
     H, W = img_shape[:2]
@@ -137,6 +134,38 @@ def expand_box_up(box, img_shape, up_factor=1.4, side_factor=0.3):
     new_w = min(W - new_x, w + int(2 * w * side_factor))
     new_h = min(H - new_y, h + new_h_up)
     return (new_x, new_y, new_w, new_h)
+
+def get_top_strip(box, img_shape, height_factor=1.4, side_factor=0.45):
+    """
+    Wąski pasek NAD etykietą – tam bywa logo/brand (np. 'Lindt').
+    """
+    x, y, w, h = box
+    H, W = img_shape[:2]
+    strip_h = int(h * height_factor)
+    new_y = max(0, y - strip_h)
+    new_x = max(0, x - int(w * side_factor))
+    new_w = min(W - new_x, w + int(2 * w * side_factor))
+    new_h = min(H - new_y, strip_h)
+    return (new_x, new_y, new_w, new_h)
+
+def ocr_logo_boost(img_bgr):
+    """
+    „Logo OCR”: powiększenie 2x, CLAHE, unsharp, Otsu.
+    Pomaga na złotych/kaligraficznych napisach.
+    """
+    up = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    lab = cv2.cvtColor(up, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    L2 = clahe.apply(L)
+    lab2 = cv2.merge([L2, A, B])
+    up = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    blur = cv2.GaussianBlur(up, (0, 0), 1.0)
+    sharp = cv2.addWeighted(up, 1.5, blur, -0.5, 0)  # unsharp
+    gray = cv2.cvtColor(sharp, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    rgb = cv2.cvtColor(th, cv2.COLOR_GRAY2RGB)
+    return safe_paddle_ocr(rgb)
 
 def parse_prices(texts):
     full = " ".join(t for t, _ in texts)
@@ -158,12 +187,10 @@ def parse_prices(texts):
 
 def extract_eans(texts, full_image_text=""):
     found = set()
-    # z regionu etykiety
     for t, _ in texts:
         for m in EAN_RE.findall(t.replace(" ", "")):
             if std_ean.is_valid(m):
                 found.add(m)
-    # z całego OCR jako fallback
     for m in EAN_RE.findall(full_image_text.replace(" ", "")):
         if std_ean.is_valid(m):
             found.add(m)
@@ -205,10 +232,8 @@ if uploaded:
         img = load_image(uploaded)
         gray = preprocess(img)
 
-        # pełny OCR zdjęcia (ułatwia łapanie EAN)
         whole_text = full_image_ocr(img)
 
-        # detekcje etykiet
         boxes = find_price_tag_candidates(gray)
         st.subheader(f"Znalezione etykiety: {len(boxes)}")
 
@@ -224,16 +249,24 @@ if uploaded:
             price_regular, price_promo, promo_flag = parse_prices(texts_tag)
             eans = extract_eans(texts_tag, whole_text)
 
-            # 2) OCR kontekstu nad etykietą (front opakowania) -> marka/nazwa
-            big_box = expand_box_up(box, img.shape, up_factor=1.4, side_factor=0.3)
+            # 2) OCR szerokiego kontekstu nad etykietą (front opakowania)
+            big_box = expand_box_up(box, img.shape, up_factor=2.2, side_factor=0.5)
             texts_ctx = ocr_region(img, big_box)
 
-            name = guess_name(texts_ctx) or guess_name(texts_tag)
+            # 2b) Pasek tuż nad etykietą – tryb „logo”
+            sx, sy, sw, sh = get_top_strip(box, img.shape, height_factor=1.4, side_factor=0.45)
+            strip_crop = img[sy:sy+sh, sx:sx+sw]
+            texts_logo = ocr_logo_boost(strip_crop)
 
-            # dopasowanie marki: najpierw substring w całym tekście, potem fuzzy na 'name'
+            # Kandydaci nazw: logo > kontekst > etykieta
+            name = (guess_name(texts_logo)
+                    or guess_name(texts_ctx)
+                    or guess_name(texts_tag))
+
+            # Dopasowanie marki: substring w całym tekście (logo+ctx+tag), potem fuzzy
             brand = None
+            joined = " ".join([t for t, _ in (texts_logo + texts_ctx + texts_tag)]).lower()
             if brand_list:
-                joined = " ".join([t for t, _ in (texts_ctx + texts_tag)]).lower()
                 direct = [b for b in brand_list if b.lower() in joined]
                 if direct:
                     brand = sorted(direct, key=len)[-1]  # najdłuższa trafiona
@@ -241,7 +274,7 @@ if uploaded:
                     match = process.extractOne(name, brand_list, scorer=fuzz.token_set_ratio)
                     if match:
                         cand, score, _ = match
-                        if score >= 78:
+                        if score >= 75:
                             brand = cand
 
             det = {
