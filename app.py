@@ -14,7 +14,7 @@ from stdnum import ean as std_ean
 # USTAWIENIA
 # -------------------------
 st.set_page_config(page_title="FMCG Shelf MVP", layout="wide")
-OCR_LANG = "pol"  # polski OCR
+OCR_LANG = "latin"  # obsługuje też polskie znaki diakrytyczne
 ocr = PaddleOCR(lang=OCR_LANG, use_angle_cls=True, show_log=False)
 
 PRICE_RE = re.compile(r'(\d{1,3}(?:[.,]\d{2})?)\s*(?:zł|PLN)', re.I)
